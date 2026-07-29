@@ -1,0 +1,11 @@
+# ESP-IDF build output
+build/
+sdkconfig.old
+
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# VS Code local state
+.vscode/
