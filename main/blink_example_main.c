@@ -10,6 +10,7 @@
 #include <uni.h>
 
 #include "controller_dac.h"
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcpp"
@@ -28,7 +29,7 @@ static const char *TAG = "xbox_dac";
 #define I2C_PORT I2C_NUM_0
 #define SDA_PIN 21
 #define SCL_PIN 22
-#define I2C_FREQ_HZ 100000
+#define I2C_FREQ_HZ 50000
 
 #define MCP4725_ADDR_START 0x60
 #define MCP4725_ADDR_END 0x67
@@ -67,6 +68,7 @@ static volatile int32_t s_latest_steering = 0;
 static volatile bool s_controller_connected = false;
 static float s_steering_zero_offset_deg = NAN;
 static bool s_twai_recovering = false;
+static uint32_t s_prev_buttons = 0;
 
 struct uni_platform* get_my_platform(void);
 
@@ -123,19 +125,28 @@ static bool steering_can_ensure_ready(void)
     return false;
 }
 
-static esp_err_t i2c_master_init(void)
+static esp_err_t i2c_master_init_pins(int sda, int scl)
 {
+    if (s_i2c_bus != NULL) {
+        i2c_del_master_bus(s_i2c_bus);
+        s_i2c_bus = NULL;
+    }
+
     const i2c_master_bus_config_t bus_config = {
         .i2c_port = I2C_PORT,
-        .sda_io_num = SDA_PIN,
-        .scl_io_num = SCL_PIN,
+        .sda_io_num = sda,
+        .scl_io_num = scl,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
 
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_config, &s_i2c_bus), TAG, "i2c_new_master_bus failed");
-    return ESP_OK;
+    return i2c_new_master_bus(&bus_config, &s_i2c_bus);
+}
+
+static esp_err_t i2c_master_init(void)
+{
+    return i2c_master_init_pins(SDA_PIN, SCL_PIN);
 }
 
 static esp_err_t steering_adc_init(void)
@@ -249,8 +260,8 @@ static float steering_axis_to_duty(int32_t steering_axis)
         steering_axis = -(int32_t)GAMEPAD_STEERING_MAX;
     }
 
-    // Negative sign keeps steering direction aligned with existing Teensy behavior.
-    return -((float)steering_axis / GAMEPAD_STEERING_MAX) * STEERING_MAX_DUTY;
+    // Invert steering direction so controller left/right matches the vehicle direction.
+    return ((float)steering_axis / GAMEPAD_STEERING_MAX) * STEERING_MAX_DUTY;
 }
 
 static float apply_steering_limit(float duty, float relative_angle_deg)
@@ -284,13 +295,35 @@ static esp_err_t mcp4725_attach(uint8_t address)
 
 static bool mcp4725_present_and_attach(void)
 {
+    int timeout_count = 0;
+    int nack_count = 0;
+    const TickType_t probe_timeout = pdMS_TO_TICKS(300);
+
     for (uint8_t addr = MCP4725_ADDR_START; addr <= MCP4725_ADDR_END; ++addr) {
-        const esp_err_t ret = i2c_master_probe(s_i2c_bus, addr, pdMS_TO_TICKS(100));
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "I2C device detected at 0x%02X", addr);
-            return mcp4725_attach(addr) == ESP_OK;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const esp_err_t ret = i2c_master_probe(s_i2c_bus, addr, probe_timeout);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "I2C device detected at 0x%02X", addr);
+                return mcp4725_attach(addr) == ESP_OK;
+            }
+
+            if (ret == ESP_ERR_TIMEOUT) {
+                timeout_count++;
+            } else {
+                nack_count++;
+                break;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(2));
         }
     }
+
+    ESP_LOGW(TAG,
+             "I2C probe summary: timeout=%d nack_or_other=%d sda=%d scl=%d",
+             timeout_count,
+             nack_count,
+             gpio_get_level(SDA_PIN),
+             gpio_get_level(SCL_PIN));
     return false;
 }
 
@@ -319,8 +352,15 @@ static esp_err_t set_dac_voltage(float requested_voltage)
 
 static float throttle_to_voltage(int32_t throttle)
 {
-    const float max_voltage = DAC_SUPPLY_VOLTAGE * 4095.0f / 4096.0f;
-    const float dead_zone_voltage = 0.72f;  // Motor starts spinning voltage
+    const float dac_max_voltage = DAC_SUPPLY_VOLTAGE * 4095.0f / 4096.0f;
+    const float motor_start_voltage = 1.14f;
+    const float speed_cap_voltage = 1.66f;  // ~4 m/s cap from field calibration.
+    const float trigger_start_fraction = 0.25f;
+
+    float throttle_max_voltage = speed_cap_voltage;
+    if (throttle_max_voltage > dac_max_voltage) {
+        throttle_max_voltage = dac_max_voltage;
+    }
 
     if (throttle < 0) {
         throttle = 0;
@@ -334,20 +374,16 @@ static float throttle_to_voltage(int32_t throttle)
 
     // Normalize throttle to 0.0-1.0
     const float normalized = throttle / GAMEPAD_TRIGGER_MAX;
-    
-    // Use a square root curve for responsive acceleration
-    // This gives you quick motor start with light trigger press,
-    // while maintaining smooth control across the full range.
-    // - 10% press (trigger ~102):   reaches ~1.2V (motor moving smoothly)
-    // - 25% press (trigger ~256):   reaches ~1.9V (good acceleration)
-    // - 50% press (trigger ~512):   reaches ~2.5V (strong response)
-    // - 100% press (trigger ~1023): reaches ~3.3V (maximum)
-    const float curved = sqrtf(normalized);
-    
-    // Map curve output to voltage range
-    float voltage = dead_zone_voltage + (curved * (max_voltage - dead_zone_voltage));
-    
-    return voltage;
+
+    // Stretch the trigger travel so the car only begins to move around 25% RT press.
+    if (normalized <= trigger_start_fraction) {
+        return (normalized / trigger_start_fraction) * motor_start_voltage;
+    }
+
+    const float post_start = (normalized - trigger_start_fraction) / (1.0f - trigger_start_fraction);
+
+    // Linear ramp after motor engagement keeps low-speed modulation predictable.
+    return motor_start_voltage + (post_start * (throttle_max_voltage - motor_start_voltage));
 }
 
 static void dac_task(void *arg)
@@ -421,6 +457,8 @@ void xbox_dac_on_controller_connected(bool connected)
     s_controller_connected = connected;
     if (!connected) {
         s_latest_throttle = 0;
+        s_latest_steering = 0;
+        s_prev_buttons = 0;
     }
 }
 
@@ -432,11 +470,44 @@ void xbox_dac_on_controller_data(const uni_controller_t* ctl)
 
     s_latest_throttle = ctl->gamepad.throttle;
     s_latest_steering = ctl->gamepad.axis_x;
+
+    const uint32_t buttons = ctl->gamepad.buttons;
+    const bool x_pressed = (buttons & BUTTON_X) != 0;
+    const bool x_was_pressed = (s_prev_buttons & BUTTON_X) != 0;
+    if (x_pressed && !x_was_pressed) {
+        s_steering_zero_offset_deg = NAN;
+        ESP_LOGI(TAG, "Steering zero requested from X button");
+    }
+    s_prev_buttons = buttons;
 }
 
 void app_main(void)
 {
-    ESP_ERROR_CHECK(i2c_master_init());
+    // Try normal pin order first, then swapped, to survive mislabelled perfboard traces.
+    const struct { int sda; int scl; } pin_candidates[] = {
+        { SDA_PIN, SCL_PIN },
+        { SCL_PIN, SDA_PIN },
+    };
+    bool dac_found = false;
+    for (int c = 0; c < (int)(sizeof(pin_candidates) / sizeof(pin_candidates[0])); ++c) {
+        int sda = pin_candidates[c].sda;
+        int scl = pin_candidates[c].scl;
+        ESP_LOGI(TAG, "Trying I2C SDA=GPIO%d SCL=GPIO%d", sda, scl);
+        if (i2c_master_init_pins(sda, scl) != ESP_OK) {
+            ESP_LOGW(TAG, "Bus init failed for SDA=%d SCL=%d", sda, scl);
+            continue;
+        }
+        if (mcp4725_present_and_attach()) {
+            ESP_LOGI(TAG, "MCP4725 found with SDA=GPIO%d SCL=GPIO%d", sda, scl);
+            dac_found = true;
+            break;
+        }
+    }
+    if (!dac_found) {
+        ESP_LOGE(TAG, "MCP4725 not found on any pin combination. Check VCC/GND/SDA/SCL and pull-ups.");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    }
+
     ESP_ERROR_CHECK(steering_adc_init());
     ESP_ERROR_CHECK(steering_can_init());
     vTaskDelay(pdMS_TO_TICKS(100));
