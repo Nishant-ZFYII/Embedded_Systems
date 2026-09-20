@@ -13,6 +13,50 @@ typedef struct my_platform_instance_s {
 static my_platform_instance_t* get_my_platform_instance(uni_hid_device_t* d);
 static void trigger_event_on_gamepad(uni_hid_device_t* d);
 
+// ---- LINK KEEP-ALIVE -----------------------------------------------------
+// MEASURED 2026-09-08: this pad transmits ONLY ON CHANGE. Held still or centred
+// it goes completely silent, and a silent Bluetooth link is eventually dropped
+// by the controller -- observed repeatedly at roughly 10 s of idle. That is
+// fatal for autonomy, because during an autonomous run the operator holds the
+// pad DELIBERATELY STILL, which is exactly the condition that kills the link.
+// The whole afternoon was worked around by tapping a button once a second.
+//
+// Sending an output report keeps real traffic on the link. set_player_leds is
+// used rather than rumble: it is silent and the operator does not feel it.
+//
+// This MUST run on the BTstack thread, so it is a btstack run-loop timer rather
+// than a call from the control loop on the other core.
+// NOTE: this does NOT affect pad_active -- that is the Bluetooth link state
+// now, not report timing. Kept only because periodic traffic is good for link
+// health. Measured 2026-09-08: it did not prevent the drop, because the drop
+// was a firmware staleness timeout, not a Bluetooth disconnect.
+#define PAD_KEEPALIVE_MS 5000
+static btstack_timer_source_t s_keepalive_timer;
+static uni_hid_device_t* s_pad_device = NULL;
+
+static void pad_keepalive_handler(btstack_timer_source_t* ts) {
+    if (s_pad_device != NULL) {
+        my_platform_instance_t* ins = get_my_platform_instance(s_pad_device);
+        static int n = 0;
+        const bool has_leds   = s_pad_device->report_parser.set_player_leds != NULL;
+        const bool has_rumble = s_pad_device->report_parser.play_dual_rumble != NULL;
+        if (has_leds) {
+            s_pad_device->report_parser.set_player_leds(s_pad_device,
+                                                        ins->gamepad_seat);
+        } else if (has_rumble) {
+            // Fallback: the shortest, weakest rumble the API allows. Some
+            // parsers implement rumble but not LEDs.
+            s_pad_device->report_parser.play_dual_rumble(s_pad_device, 0, 1, 1, 1);
+        }
+        if ((n++ % 5) == 0) {
+            logi("custom: keepalive tick %d leds=%d rumble=%d\n",
+                 n, (int)has_leds, (int)has_rumble);
+        }
+    }
+    btstack_run_loop_set_timer(ts, PAD_KEEPALIVE_MS);
+    btstack_run_loop_add_timer(ts);
+}
+
 static void my_platform_init(int argc, const char** argv) {
     ARG_UNUSED(argc);
     ARG_UNUSED(argv);
@@ -45,6 +89,9 @@ static void my_platform_on_device_connected(uni_hid_device_t* d) {
 
 static void my_platform_on_device_disconnected(uni_hid_device_t* d) {
     logi("custom: device disconnected: %p\n", d);
+    if (s_pad_device == d) {
+        s_pad_device = NULL;
+    }
     xbox_dac_on_controller_connected(false);
 }
 
@@ -56,6 +103,15 @@ static uni_error_t my_platform_on_device_ready(uni_hid_device_t* d) {
 
     xbox_dac_on_controller_connected(true);
     trigger_event_on_gamepad(d);
+
+    // Start (or re-target) the keep-alive now that a pad is actually present.
+    s_pad_device = d;
+    btstack_run_loop_remove_timer(&s_keepalive_timer);
+    btstack_run_loop_set_timer_handler(&s_keepalive_timer, pad_keepalive_handler);
+    btstack_run_loop_set_timer(&s_keepalive_timer, PAD_KEEPALIVE_MS);
+    btstack_run_loop_add_timer(&s_keepalive_timer);
+    logi("custom: pad keep-alive every %d ms\n", PAD_KEEPALIVE_MS);
+
     return UNI_ERROR_SUCCESS;
 }
 
@@ -63,6 +119,13 @@ static void my_platform_on_controller_data(uni_hid_device_t* d, uni_controller_t
     static uni_controller_t prev = {0};
 
     ARG_UNUSED(d);
+
+    // Stamp liveness BEFORE the duplicate filter below. The filter exists to
+    // skip redundant downstream work, but a held stick sends identical reports
+    // forever -- so timestamping after it made a motionless stick look like a
+    // dead controller, and the staleness check then zeroed the steering duty
+    // mid-stroke.
+    xbox_dac_note_controller_alive();
 
     if (memcmp(&prev, ctl, sizeof(*ctl)) == 0) {
         return;

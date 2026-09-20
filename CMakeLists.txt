@@ -2,7 +2,11 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.22)
 
-set(EXTRA_COMPONENT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/external/bluepad32/src/components)
+# btstack ships as its own IDF component inside bluepad32's submodule and must
+# be on the component path too, or bluepad32 fails to resolve it.
+set(EXTRA_COMPONENT_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/bluepad32/src/components
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/bluepad32/external/btstack/port/esp32/components)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
