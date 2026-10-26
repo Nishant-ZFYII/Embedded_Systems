@@ -157,6 +157,21 @@ static const char *TAG = "xbox_dac";
 // Plausibility window for the brake pot, same idea as the steering rail check.
 // A disconnected pot reads a rail and the bang-bang loop would then drive the
 // actuator into a mechanical stop and hold it there.
+// DEBOUNCE, added 2026-10-01. A single implausible sample used to disable the
+// brake driver outright. Measured on the bench: 1,274 samples over 25 s, median
+// 32, and 7 of them (0.5%) at or below the rail -- so the driver was being
+// disabled and re-enabled about every 3.5 s while nothing was wrong.
+//
+// The cause is physical and not fixable here: the pot is unscaled, so the whole
+// 0.9 in working stroke sits near the BOTTOM of the ADC range (median 32 of
+// 4095, about 26 mV) where the ESP32's converter is at its worst. The steering
+// already averages 12 samples for the same reason; the brake took one shot.
+//
+// A genuinely disconnected pot rails CONTINUOUSLY, so requiring consecutive
+// bad samples keeps all the real protection and rejects single-sample noise.
+// Scale the pot properly and this can go back to 1.
+#define BRAKE_FAULT_COUNTS 3      // consecutive bad samples before disabling
+#define BRAKE_OK_COUNTS    3      // consecutive good samples before recovering
 #define BRAKE_ADC_RAIL_LO 4
 #define BRAKE_ADC_RAIL_HI 4090
 
@@ -191,6 +206,22 @@ static volatile int64_t s_last_ctl_us = 0;
 static float s_steering_zero_offset_deg = NAN;
 static bool s_twai_recovering = false;
 static uint32_t s_prev_buttons = 0;
+
+// ---- OPERATOR E-STOP (item 9) -------------------------------------------
+// X latches it. Both shoulder buttons held for E_STOP_CLEAR_MS clears it.
+//
+// X was chosen because it was already dead -- it used to re-zero the steering,
+// which was removed on 2026-09-08 when the zero became absolute, and since then
+// it only logged a warning. An e-stop should be the easiest button to hit, and
+// a false trigger costs a stop, which is the safe direction.
+//
+// Clearing deliberately is NOT the same button. L+R together, held for a full
+// second, cannot happen while flailing at the pad.
+#define E_STOP_CLEAR_MS 1000
+static volatile bool s_estop = false;
+static int s_brake_bad_run = 0;      // consecutive implausible brake samples
+static int s_brake_ok_run = 0;       // consecutive good ones
+static volatile int64_t s_lr_down_us = 0;   // 0 = not both held
 
 // ---- PAD CRUISE SETPOINT -------------------------------------------------
 // For mapping throttle voltage to real speed OUTDOORS, where the operator is on
@@ -703,11 +734,27 @@ static void dac_task(void *arg)
         // Jetson throttle authority (v2), gated the same way as the brake.
         // Throttle is the only actuator that ADDS energy, so it is the last
         // one enabled and the first one dropped.
+        // ---- E-STOP ----------------------------------------------------
+        // Polled here rather than in the pad callback: the pad transmits only
+        // on CHANGE, so a held button produces no events and a callback-side
+        // timer would never fire.
+        if (s_estop && s_lr_down_us != 0 &&
+            (esp_timer_get_time() - s_lr_down_us) > (E_STOP_CLEAR_MS * 1000)) {
+            s_estop = false;
+            s_lr_down_us = 0;
+            jetson_link_note_estop(false);
+            ESP_LOGW(TAG, "E-STOP CLEARED by L+R hold. Mode stays FAULT until "
+                          "the pad is centred -- the normal gate applies again.");
+        }
+
         int32_t throttle_source = throttle;
         float jetson_throttle = 0.0f;
+        // Same mislabel the brake had: $T field 6 reports the PAD throttle, so
+        // it reads 0 while Autoware is driving. Report what actually went out.
         if (jetson_link_throttle_override(&jetson_throttle)) {
             throttle_source = (int32_t)(jetson_throttle * GAMEPAD_TRIGGER_MAX);
         }
+        if (s_estop) throttle_source = 0;       // E-STOP: no energy added
         float target_voltage = throttle_to_voltage(throttle_source);
         // Cruise is a MANUAL-ONLY TEST AID for mapping throttle voltage to real
         // speed outdoors, where the operator is on the kart and cannot reach a
@@ -721,7 +768,7 @@ static void dac_task(void *arg)
         //
         // Also requires the pad present: losing it zeroes throttle anyway via
         // the disconnect callback.
-        if (jetson_link_mode() == JLINK_MANUAL && connected &&
+        if (!s_estop && jetson_link_mode() == JLINK_MANUAL && connected &&
             s_cruise_v > target_voltage) {
             target_voltage = s_cruise_v;
         }
@@ -750,12 +797,31 @@ static void dac_task(void *arg)
         // reason the steering needed them: an ignored return value or a railed
         // pot silently becomes a command.
         const int32_t brake_trigger = connected ? s_latest_brake : 0;
+        // What ACTUALLY drove the actuator this cycle, for telemetry. $T used
+        // to report brake_trigger under the name "brake_cmd", which is the PAD
+        // trigger only -- so with the Jetson commanding the brake and the
+        // trigger untouched, telemetry read 0 while the actuator ran to full
+        // extension. Measured 2026-10-01: brake ADC tracked 92/208/400 exactly
+        // as commanded while the field sat at 0 throughout. A field whose name
+        // says "cmd" and whose value ignores the commander is worse than no
+        // field.
+        int32_t brake_effective = brake_trigger;
         int raw_brake_adc = 0;
         const esp_err_t brake_adc_ret =
             adc_oneshot_read(s_adc, BRAKE_ADC_CHANNEL, &raw_brake_adc);
 
-        if (brake_adc_ret != ESP_OK ||
-            raw_brake_adc <= BRAKE_ADC_RAIL_LO || raw_brake_adc >= BRAKE_ADC_RAIL_HI) {
+        const bool brake_sample_bad =
+            (brake_adc_ret != ESP_OK ||
+             raw_brake_adc <= BRAKE_ADC_RAIL_LO || raw_brake_adc >= BRAKE_ADC_RAIL_HI);
+        if (brake_sample_bad) {
+            if (s_brake_bad_run < BRAKE_FAULT_COUNTS) s_brake_bad_run++;
+            s_brake_ok_run = 0;
+        } else {
+            if (s_brake_ok_run < BRAKE_OK_COUNTS) s_brake_ok_run++;
+            s_brake_bad_run = 0;
+        }
+
+        if (s_brake_bad_run >= BRAKE_FAULT_COUNTS) {
             // The original ignored the return value entirely and would drive on
             // a stale or zero reading. A railed pot means the feedback is gone,
             // and bang-bang against no feedback runs the actuator into a stop.
@@ -768,11 +834,15 @@ static void dac_task(void *arg)
             brake_disable();
         } else {
             s_brake_raw = raw_brake_adc;
-            if (s_brake_fault) {
+            if (s_brake_fault && s_brake_ok_run >= BRAKE_OK_COUNTS) {
                 ESP_LOGI(TAG, "brake pot recovered");
                 s_brake_fault = false;
                 gpio_set_level(BRAKE_EN_PIN, 1);
             }
+            if (s_brake_fault) {
+                // still latched and not yet confirmed good -- do not drive
+                brake_stop();
+            } else {
             if (s_smoothed_brake_adc < 0.0f) {
                 s_smoothed_brake_adc = (float)raw_brake_adc;
             }
@@ -788,15 +858,24 @@ static void dac_task(void *arg)
             if (jetson_link_brake_override(&jetson_brake)) {
                 brake_source = (int32_t)(jetson_brake * 1023.0f);
             }
+            brake_effective = brake_source;
             int target_brake_adc = map_val(brake_source, 0, 1023,
                                            BRAKE_ADC_MIN, BRAKE_ADC_MAX);
+            // TWO DIFFERENT LOSSES, TWO DIFFERENT ANSWERS. Decided 2026-10-01.
+            //
+            // Pad/command loss -> RELEASE. The operator is still on the kart
+            // and still has the mechanical pedal; grabbing the brake out from
+            // under them because a radio packet went missing is worse than
+            // coasting. This was already the behaviour; it is now a stated
+            // decision rather than an inherited default.
             if (!connected) {
-                // FAIL DIRECTION -- see 16_brake_integration_review.md.
-                // This RELEASES the brake on loss of the controller, which is
-                // the original behaviour and is NOT obviously right for a
-                // vehicle. Deliberately left as-is pending the datasheet
-                // answer, but it is a decision, not a default.
                 target_brake_adc = BRAKE_ADC_MIN;
+            }
+            // E-STOP -> ENGAGE. A human has just asked the vehicle to stop.
+            // Last, so it overrides everything above including the Jetson's
+            // brake authority and the release just set.
+            if (s_estop) {
+                target_brake_adc = BRAKE_ADC_MAX;
             }
             if (target_brake_adc < BRAKE_ADC_MIN) target_brake_adc = BRAKE_ADC_MIN;
             if (target_brake_adc > BRAKE_ADC_MAX) target_brake_adc = BRAKE_ADC_MAX;
@@ -810,6 +889,7 @@ static void dac_task(void *arg)
                 else brake_retract(pwm);
             } else {
                 brake_stop();
+            }
             }
         }
 
@@ -828,7 +908,14 @@ static void dac_task(void *arg)
         // Applying it here, on the FINAL duty whatever mode produced it, is the
         // only version that is actually a limit. Keep this the LAST thing that
         // touches steering_duty before it goes on the wire.
-        steering_duty = apply_steering_limit(steering_duty, s_steering_raw);
+steering_duty = apply_steering_limit(steering_duty, s_steering_raw);
+
+        // E-STOP IS THE VERY LAST WORD ON STEERING. Placed after the end-stop
+        // limiter for the same reason that limiter was moved here on
+        // 2026-09-08: anything applied earlier gets overwritten by
+        // jetson_link_arbitrate() in AUTO, and autonomy then bypasses it
+        // entirely. Keep this last.
+        if (s_estop) steering_duty = 0.0f;
 
         if (last_voltage < 0.0f || fabsf(target_voltage - last_voltage) >= 0.01f) {
             const esp_err_t ret = set_dac_voltage(target_voltage);
@@ -858,9 +945,9 @@ static void dac_task(void *arg)
         }
 
         jetson_link_publish(steering_angle_deg, steering_duty, steering_axis,
-                            throttle, connected, s_steering_raw,
-                            s_brake_raw, brake_trigger, s_brake_fault,
-                            s_cruise_v);
+                            throttle_source, connected, s_steering_raw,
+                            s_brake_raw, brake_effective, s_brake_fault,
+                            s_cruise_v, target_voltage);
 
         // The periodic status line used to live here. It was written with
         // ESP_LOGI, which reaches UART0 via stdout/VFS, while jetson_link
@@ -925,14 +1012,29 @@ void xbox_dac_on_controller_data(const uni_controller_t* ctl)
         ESP_LOGW(TAG, "cruise CLEARED by B");
     }
 
+    // BOTH SHOULDERS: the clear gesture. Only the DOWN edge is timed here; the
+    // 1 s hold is checked in dac_task, because this pad transmits only on
+    // CHANGE -- holding a button generates no further events, so a timer that
+    // lived in this callback would never fire.
+    const bool lr_now = (buttons & (BUTTON_SHOULDER_L | BUTTON_SHOULDER_R)) ==
+                        (BUTTON_SHOULDER_L | BUTTON_SHOULDER_R);
+    if (lr_now && s_lr_down_us == 0) {
+        s_lr_down_us = esp_timer_get_time();
+    } else if (!lr_now) {
+        s_lr_down_us = 0;
+    }
+
     if (x_pressed && !x_was_pressed) {
-        // The X button used to re-zero the steering at the current position.
-        // That is exactly the boot-relative behaviour removed on 2026-09-08:
-        // the zero is now the MEASURED absolute STEERING_ADC_ZERO, so there is
-        // nothing to reset and pressing X must not move the reference. Kept as
-        // a log line only, so an old habit does not silently do nothing.
-        ESP_LOGW(TAG, "X pressed: steering zero is now ABSOLUTE "
-                      "(STEERING_ADC_ZERO=%d) and cannot be re-zeroed here",
+        if (!s_estop) {
+            s_estop = true;
+            jetson_link_note_estop(true);
+            ESP_LOGE(TAG, "*** E-STOP LATCHED (pad X) *** steering 0, throttle 0, "
+                          "BRAKE ENGAGED. Hold both shoulders %d ms to clear.",
+                     E_STOP_CLEAR_MS);
+        }
+        // The old re-zero note, kept so an old habit does not silently do
+        // nothing: the steering zero is absolute and cannot be reset here.
+        ESP_LOGW(TAG, "(steering zero is ABSOLUTE, STEERING_ADC_ZERO=%d)",
                  STEERING_ADC_ZERO);
     }
     s_prev_buttons = buttons;

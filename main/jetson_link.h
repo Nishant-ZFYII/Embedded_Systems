@@ -59,6 +59,7 @@ typedef enum {
     JLINK_FAULT_ADC,          // steering angle sensor read failed
     JLINK_FAULT_CAN,          // TWAI bus-off
     JLINK_FAULT_BRAKE,        // brake pot implausible
+    JLINK_FAULT_ESTOP,        // operator pressed the pad E-STOP (X). LATCHED.
 } jlink_fault_t;
 
 // Start the link. Safe to call before or after the CAN/ADC init.
@@ -88,7 +89,12 @@ bool jetson_link_throttle_override(float* out_0_1);
 void jetson_link_publish(float angle_deg, float applied_duty, int32_t axis,
                          int32_t throttle, bool pad_active, int raw_adc,
                          int brake_raw, int32_t brake_cmd, bool brake_fault,
-                         float cruise_v);
+                         float cruise_v, float dac_v);
 
 jlink_mode_t jetson_link_mode(void);
 void jetson_link_note_can_fault(void);
+
+// Operator E-STOP, latched. While true the link is held in FAULT and the normal
+// pad-centred auto-clear is refused, so AUTO cannot re-arm by itself. Clearing
+// is a deliberate pad gesture handled in blink_example_main.c.
+void jetson_link_note_estop(bool latched);

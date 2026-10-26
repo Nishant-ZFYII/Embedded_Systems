@@ -40,6 +40,7 @@ static const char *TAG = "jlink";
 // ---------------------------------------------------------------------------
 static volatile jlink_mode_t s_mode = JLINK_MANUAL;
 static volatile jlink_fault_t s_fault = JLINK_FAULT_NONE;
+static volatile bool s_estop = false;      // operator E-STOP, latched
 
 static volatile float s_cmd_duty = 0.0f;      // last accepted Jetson setpoint
 static volatile float s_cmd_throttle = 0.0f;  // 0..1
@@ -256,6 +257,30 @@ bool jetson_link_throttle_override(float* out_0_1)
     return true;
 }
 
+void jetson_link_note_estop(bool latched)
+{
+    s_estop = latched;
+    if (latched) {
+        s_fault = JLINK_FAULT_ESTOP;
+        s_mode = JLINK_FAULT;
+    } else {
+        // D-59, 2026-10-01. Clearing s_estop is NOT enough and this was wrong
+        // when first written. The output gates live in two places: the
+        // overrides in blink_example_main.c (released as soon as s_estop goes
+        // false) and s_mode == JLINK_FAULT here, which forces duty to 0
+        // regardless. Dropping only the first released the BRAKE and left the
+        // STEERING dead -- exactly what the operator reported.
+        //
+        // FAULT is latched and, by rule 3, leaves only through the gate below,
+        // which until now was reachable only by the Jetson sending $X. Raising
+        // the same request here lets the pad clear its own e-stop while keeping
+        // every condition that gate already enforces: pad centred, angle
+        // finite, and now !s_estop. The pad cannot bypass those, it can only
+        // ASK, which is the point.
+        s_clear_request = true;
+    }
+}
+
 void jetson_link_note_can_fault(void)
 {
     if (s_mode == JLINK_AUTO) {
@@ -291,7 +316,12 @@ float jetson_link_arbitrate(float manual_duty, bool pad_active, bool pad_centred
 
     if (s_clear_request) {
         s_clear_request = false;
-        if (pad_centred && s_mode == JLINK_FAULT && isfinite(angle_deg)) {
+        // E-STOP refuses this gate deliberately. Every other fault here clears
+        // itself once the pad is centred and the sensor is sane -- which is
+        // right for a transient, and completely wrong for a human who has just
+        // hit the stop button. An E-STOP that un-latches on its own is not an
+        // E-STOP.
+        if (!s_estop && pad_centred && s_mode == JLINK_FAULT && isfinite(angle_deg)) {
             s_fault = JLINK_FAULT_NONE;
             s_mode = JLINK_MANUAL;
             ESP_LOGI(TAG, "fault cleared -> MANUAL");
@@ -419,11 +449,11 @@ float jetson_link_arbitrate(float manual_duty, bool pad_active, bool pad_centred
 void jetson_link_publish(float angle_deg, float applied_duty, int32_t axis,
                          int32_t throttle, bool pad_active, int raw_adc,
                          int brake_raw, int32_t brake_cmd, bool brake_fault,
-                         float cruise_v)
+                         float cruise_v, float dac_v)
 {
     char body[JLINK_LINE_MAX];
     const int n = snprintf(body, sizeof(body),
-                           "T,%u,%d,%.2f,%.4f,%ld,%ld,%u,%u,%u,%d,%d,%ld,%d,%.3f",
+                           "T,%u,%d,%.2f,%.4f,%ld,%ld,%u,%u,%u,%d,%d,%ld,%d,%.3f,%.3f",
                            (unsigned)s_cmd_seq, (int)s_mode,
                            isfinite(angle_deg) ? angle_deg : NAN,
                            applied_duty, (long)axis, (long)throttle,
@@ -436,7 +466,14 @@ void jetson_link_publish(float angle_deg, float applied_duty, int32_t axis,
                            // setpoint in volts, so an outdoor throttle-to-speed
                            // run is recorded automatically instead of on paper.
                            // Parsers tolerate extra fields by design.
-                           cruise_v);
+                           cruise_v,
+                           // 15th field, added 2026-10-01. The ACTUAL DAC
+                           // voltage on the wire. Item 17 asks whether the
+                           // throttle sits in the measured 1.14-1.66 V band,
+                           // and nothing in $T carried it -- field 6 is the PAD
+                           // throttle, which reads 0 while Autoware drives.
+                           // Parsers tolerate extra fields by design.
+                           dac_v);
     if (n <= 0 || n >= (int)sizeof(body)) return;
 
     char out[JLINK_LINE_MAX + 8];
